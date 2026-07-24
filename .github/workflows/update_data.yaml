@@ -1,15 +1,17 @@
-name: Daily RBI Card Data Sync Pipeline
+name: RBI Card Data Sync Pipeline
 
 on:
   schedule:
-    # 11:00 AM IST every day = 05:30 UTC (IST is UTC+5:30, no daylight saving).
-    # GitHub Actions cron runs in UTC and can be delayed a few minutes during
-    # platform load, so treat 11:00 AM IST as a target, not an exact guarantee.
-    - cron: '30 5 * * *'
+    # Twice daily, in UTC. IST is a fixed UTC+5:30 with no daylight saving, so:
+    #   05:30 UTC = 11:00 AM IST
+    #   12:30 UTC =  6:00 PM IST
+    # GitHub Actions cron can be delayed a few minutes under platform load, so
+    # treat these as targets rather than exact guarantees.
+    - cron: '30 5,12 * * *'
   workflow_dispatch: # Allows manual trigger execution testing via GitHub UI
 
-# Prevent overlapping runs if a manual trigger fires while the daily schedule
-# is still running (or vice versa) — avoids two commits racing on data.json.
+# Prevent overlapping runs if a manual trigger fires while a scheduled run is
+# still going — avoids two commits racing on data.json.
 concurrency:
   group: rbi-data-sync
   cancel-in-progress: false
@@ -43,7 +45,8 @@ jobs:
         git config --global user.name "Automated Data Ingestion Action"
         git config --global user.email "actions@github.com"
         git add data.json
-        # Only push if there are actual balance variance updates in the values —
-        # RBI typically publishes once a month, so most daily runs will find
-        # nothing new and this keeps the commit history clean.
+        # scraper.py stamps a fresh generated_at on every successful run, so this
+        # commits on each run. That is deliberate: the dashboard's freshness
+        # indicator reads generated_at to prove the pipeline is alive, and would
+        # otherwise report "stale" during the ~30 days between RBI publications.
         git diff --quiet && git diff --staged --quiet || (git commit -m "System Sync: Compiled latest RBI Card Data Matrix" && git push)
