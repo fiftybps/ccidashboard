@@ -7,6 +7,91 @@
 <meta name="description" content="RBI credit card industry analytics — outstanding cards, spend, transactions and bank-wise market share.">
 <link rel="canonical" href="https://fiftybps.github.io/ccidashboard/">
 
+<!-- Favicon and platform icons -->
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="favicon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="theme-color" content="#0052CC">
+
+<!-- ============================================================
+     STRUCTURED DATA (JSON-LD)
+     ============================================================
+     Tells search engines what this page actually is rather than
+     leaving them to guess from markup. Two objects:
+
+     Dataset  - makes the page eligible for Google Dataset Search,
+                which is the single most relevant surface for a
+                public statistics dashboard like this one.
+     WebSite  - supplies the site name and publisher so results
+                render with a proper title rather than a bare URL.
+
+     Both are static on purpose. Anything month-specific here would
+     go stale the moment the pipeline publishes a new month.
+============================================================ -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Dataset",
+      "name": "India Credit Card Industry Statistics, bank-wise",
+      "alternateName": "Credit Card Industry Dashboard",
+      "description": "Monthly bank-wise credit card statistics for India, derived from the Reserve Bank of India's published ATM, POS and card statistics. Covers cards outstanding, point-of-sale and online spend, transaction volumes, average ticket size, market share and month-on-month growth for every scheduled bank issuing credit cards in India. Spend figures exclude ATM cash withdrawals, which are reported separately.",
+      "url": "https://fiftybps.github.io/ccidashboard/",
+      "keywords": [
+        "credit cards",
+        "India",
+        "Reserve Bank of India",
+        "RBI",
+        "payments",
+        "banking",
+        "market share",
+        "cards outstanding",
+        "card spend"
+      ],
+      "isAccessibleForFree": true,
+      "license": "https://creativecommons.org/licenses/by/4.0/",
+      "creator": {
+        "@type": "Person",
+        "name": "Numan Ahmad"
+      },
+      "isBasedOn": {
+        "@type": "Dataset",
+        "name": "ATM/POS/Card Statistics",
+        "url": "https://rbi.org.in/scripts/atmview.aspx",
+        "creator": {
+          "@type": "Organization",
+          "name": "Reserve Bank of India",
+          "alternateName": "RBI"
+        }
+      },
+      "spatialCoverage": {
+        "@type": "Place",
+        "name": "India"
+      },
+      "distribution": [
+        {
+          "@type": "DataDownload",
+          "encodingFormat": "application/json",
+          "contentUrl": "https://fiftybps.github.io/ccidashboard/data.json"
+        }
+      ],
+      "measurementTechnique": "Automated extraction from the Reserve Bank of India's monthly published spreadsheets, republished without adjustment."
+    },
+    {
+      "@type": "WebSite",
+      "name": "Credit Card Industry Dashboard",
+      "url": "https://fiftybps.github.io/ccidashboard/",
+      "inLanguage": "en-IN",
+      "author": {
+        "@type": "Person",
+        "name": "Numan Ahmad"
+      }
+    }
+  ]
+}
+</script>
+
 <!-- ============================================================
      OPEN GRAPH / SOCIAL PREVIEW
      ============================================================

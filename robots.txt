@@ -1,0 +1,9 @@
+# Credit Card Industry Dashboard
+# Note: this file sits at /ccidashboard/robots.txt. Crawlers only read
+# robots.txt from the domain root, so this copy is informational today and
+# becomes active if the site ever moves to a root domain. No rules here
+# restrict anything, which matches the intent: the site should be indexed.
+User-agent: *
+Allow: /
+
+Sitemap: https://fiftybps.github.io/ccidashboard/sitemap.xml
