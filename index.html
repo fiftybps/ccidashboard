@@ -478,6 +478,28 @@ table.data-table tbody td:nth-child(2){ text-align:left; }
 table.data-table.hide-yoy thead th:last-child,
 table.data-table.hide-yoy tbody td:last-child{ display:none; }
 
+/* Insights section tabs and the outlier tables behind them */
+.insight-tabs{ margin-bottom:16px; }
+.outlier-note{ font-size:12px; color:var(--text-secondary); line-height:1.6; margin-bottom:14px; max-width:105ch; }
+.outlier-block{ margin-bottom:22px; }
+.outlier-block h4{
+  font-size:12px; font-weight:800; text-transform:uppercase; letter-spacing:.05em;
+  margin-bottom:8px; display:flex; align-items:center; gap:7px;
+}
+.outlier-block h4 .count{
+  font-family:var(--font-body); font-weight:700; font-size:10.5px; text-transform:none;
+  letter-spacing:0; color:var(--text-tertiary); background:var(--surface-sunken);
+  border:1px solid var(--border); border-radius:999px; padding:1px 7px;
+}
+.outlier-empty{ font-size:12px; color:var(--text-tertiary); padding:12px 2px; }
+/* z-score strength chip: how far outside its own normal range a bank sits */
+.z-chip{
+  display:inline-block; min-width:46px; text-align:center; padding:2px 7px; border-radius:5px;
+  font-family:var(--font-mono); font-size:10.5px; font-weight:700;
+}
+.z-hot{ background:rgba(54,179,126,.14); color:var(--accent); }
+.z-cold{ background:rgba(255,86,48,.13); color:var(--negative); }
+
 /* Label for the leaderboard's channel-column toggle */
 .channel-view-wrap{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
 .channel-view-label{
@@ -1058,7 +1080,17 @@ footer.site-footer{ border-top:1px solid var(--border); padding:28px 0 8px; marg
             </select>
           </div>
         </div>
+        <div class="pill-toggle insight-tabs" id="insightTabs" role="tablist" aria-label="Insight view">
+          <button data-itab="insights" class="active">Insights</button>
+          <button data-itab="cards">Card additions vs own trend</button>
+          <button data-itab="spend">Spend vs own trend</button>
+        </div>
         <div class="insights-grid" id="insightsGrid"></div>
+        <div id="outlierPanel" hidden>
+          <p class="outlier-note" id="outlierNote"></p>
+          <div id="outlierAbove"></div>
+          <div id="outlierBelow"></div>
+        </div>
       </section>
 
       <!-- ================= 9. DOWNLOADS ================= -->
@@ -1368,6 +1400,8 @@ const state = {
   trendRange: "6",
   trendMetric: "cards_outstanding",
   shareBasis: "cards",          // 'cards' | 'spend'
+  // Insights section view: prose cards, or a bank-vs-own-trend outlier table.
+  insightTab: "insights",       // 'insights' | 'cards' | 'spend'
   // Leaderboard channel columns: 'pct' = POS/Online/Others as % of spend,
   // 'value' = the same three in ₹Cr, 'txns' = the same three as transaction counts.
   // ATM is deliberately NOT part of this group — it is a cash advance, not spend.
@@ -2396,6 +2430,179 @@ function renderExecutiveBrief(monthLabel) {
   el.textContent = buildExecutiveBriefText(monthLabel);
 }
 
+/* ============================================================
+   OWN-TREND OUTLIER DETECTION
+   ============================================================
+   The problem this solves: 50,000 new cards is a routine month for HDFC and an
+   extraordinary one for Bank of Baroda. Comparing banks against each other in
+   absolute terms therefore only ever surfaces the largest issuers.
+
+   So each bank is measured against ITS OWN recent history instead, as a z-score:
+
+       z = (this month - own trailing mean) / own trailing standard deviation
+
+   z is unit-free, so a small issuer breaking its own pattern ranks alongside a
+   large one doing the same. Baroda at 40k against a 10.7k average scores far
+   higher than HDFC at 240k against a 208k average, which is the intent.
+
+   Three guards keep it honest:
+     - sigma floor: a bank posting near-identical numbers every month has a
+       standard deviation near zero, which would make any change look infinite.
+       Floored at the larger of 15% of the mean or a small absolute value.
+     - multiple gate: the month must also be at least MULT_GATE times the mean
+       (or below its inverse), so a statistically clean but commercially
+       meaningless move cannot qualify.
+     - base floor: portfolios under MIN_BASE cards are excluded as noise.
+============================================================ */
+
+const TREND_LOOKBACK = 6;      // trailing months used when available
+const TREND_MIN = 3;           // minimum trailing months before a bank can qualify
+const Z_GATE = 1.5;            // how far outside its own range a bank must sit
+const MULT_GATE = 1.3;         // and how much bigger than its own average
+const OUTLIER_MIN_BASE = 50000;
+
+function statsOf(arr) {
+  const n = arr.length;
+  const mean = arr.reduce((a, b) => a + b, 0) / n;
+  const variance = arr.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n;
+  return { mean, sd: Math.sqrt(variance) };
+}
+
+/* metric: "cards" compares monthly NET ADDITIONS (a flow, so it needs one extra
+   month of history to difference); "spend" compares monthly spend value, which
+   is already a level and is both steadier and easier to read as a level. */
+function computeTrendOutliers(monthLabel, metric) {
+  const idx = database.months.indexOf(monthLabel);
+  if (idx === -1) return { above: [], below: [], window: 0 };
+
+  // Months strictly older than the selected one, nearest first.
+  const older = database.months.slice(idx + 1);
+  // Net additions need one extra month to difference against.
+  const needed = metric === "cards" ? TREND_LOOKBACK + 1 : TREND_LOOKBACK;
+  const windowMonths = older.slice(0, needed);
+  const minNeeded = metric === "cards" ? TREND_MIN + 1 : TREND_MIN;
+  if (windowMonths.length < minNeeded) return { above: [], below: [], window: 0 };
+
+  const byMonth = {};
+  [monthLabel].concat(windowMonths).forEach(m => {
+    byMonth[m] = {};
+    getComputedMonth(m).forEach(b => { byMonth[m][b.bank_name] = b; });
+  });
+
+  const current = getComputedMonth(monthLabel);
+  const above = [], below = [];
+  let usedWindow = 0;
+
+  current.forEach(bank => {
+    if ((bank.cards_outstanding || 0) < OUTLIER_MIN_BASE) return;
+
+    // Build this bank's own trailing series.
+    const series = [];
+    if (metric === "cards") {
+      const chain = [monthLabel].concat(windowMonths);
+      for (let i = 1; i < chain.length; i++) {
+        const now = byMonth[chain[i - 1]][bank.bank_name];
+        const prev = byMonth[chain[i]][bank.bank_name];
+        if (!now || !prev) break;
+        series.push(now.cards_outstanding - prev.cards_outstanding);
+      }
+    } else {
+      const chain = [monthLabel].concat(windowMonths);
+      for (let i = 0; i < chain.length; i++) {
+        const rec = byMonth[chain[i]][bank.bank_name];
+        if (!rec) break;
+        series.push(rec.total_spend);
+      }
+    }
+    // series[0] is the current month; the rest is the bank's own history.
+    if (series.length < minNeeded) return;
+    const value = series[0];
+    const history = series.slice(1);
+    usedWindow = Math.max(usedWindow, history.length);
+
+    const { mean, sd } = statsOf(history);
+    if (!isFinite(mean)) return;
+    // Floor sigma so a metronomic bank cannot produce a runaway z.
+    const floor = Math.max(Math.abs(mean) * 0.15, metric === "cards" ? 300 : 5);
+    const sigma = Math.max(sd, floor);
+    const z = (value - mean) / sigma;
+    const mult = mean !== 0 ? value / mean : null;
+
+    const row = { bank: bank.bank_name, type: bank.bank_type, value, mean, sd, z, mult,
+                  cards: bank.cards_outstanding, months: history.length };
+
+    if (z >= Z_GATE && mult !== null && mult >= MULT_GATE) above.push(row);
+    else if (z <= -Z_GATE && mult !== null && mult <= 1 / MULT_GATE) below.push(row);
+  });
+
+  above.sort((a, b) => b.z - a.z);
+  below.sort((a, b) => a.z - b.z);
+  return { above, below, window: usedWindow };
+}
+
+function renderOutlierTable(rows, metric, direction) {
+  if (!rows.length) {
+    return `<div class="outlier-empty">No bank broke meaningfully ${direction === "above" ? "above" : "below"} its own recent range this month.</div>`;
+  }
+  const isCards = metric === "cards";
+  const fmt = v => isCards ? ((v >= 0 ? "+" : "") + num(Math.round(v))) : (money(Math.round(v)) + " Cr");
+  const head = isCards
+    ? ["Bank", "Net adds this month", "Own avg", "vs avg", "How unusual"]
+    : ["Bank", "Spend this month", "Own avg", "vs avg", "How unusual"];
+  const body = rows.map(r => `
+    <tr data-bank="${r.bank.replace(/"/g, "&quot;")}">
+      <td class="bank-name-cell">${r.bank}</td>
+      <td>${fmt(r.value)}</td>
+      <td>${fmt(r.mean)}</td>
+      <td>${r.mult !== null && isFinite(r.mult) && r.mult > 0 ? r.mult.toFixed(1) + "x" : "—"}</td>
+      <td><span class="z-chip ${direction === "above" ? "z-hot" : "z-cold"}">${(r.z >= 0 ? "+" : "") + r.z.toFixed(1)}&sigma;</span></td>
+    </tr>`).join("");
+  return `<div class="table-wrap"><table class="data-table outlier-table" style="min-width:640px;">
+    <thead><tr>${head.map(h => `<th style="cursor:default;">${h}</th>`).join("")}</tr></thead>
+    <tbody>${body}</tbody></table></div>`;
+}
+
+function renderOutliers(monthLabel) {
+  const metric = state.insightTab === "spend" ? "spend" : "cards";
+  const panel = document.getElementById("outlierPanel");
+  const grid = document.getElementById("insightsGrid");
+  const showOutliers = state.insightTab !== "insights";
+  panel.hidden = !showOutliers;
+  grid.style.display = showOutliers ? "none" : "";
+  document.querySelectorAll("#insightTabs button").forEach(b =>
+    b.classList.toggle("active", b.dataset.itab === state.insightTab));
+  if (!showOutliers) return;
+
+  const { above, below, window: win } = computeTrendOutliers(monthLabel, metric);
+  const unit = metric === "cards" ? "net card additions" : "spend";
+  const noteEl = document.getElementById("outlierNote");
+
+  if (!win) {
+    noteEl.textContent = `Not enough reporting history yet. Each bank needs at least ${metric === "cards" ? TREND_MIN + 1 : TREND_MIN} prior months to establish its own trend before an unusual month can be identified.`;
+    document.getElementById("outlierAbove").innerHTML = "";
+    document.getElementById("outlierBelow").innerHTML = "";
+    return;
+  }
+
+  noteEl.innerHTML = `Every bank is measured against <b>its own</b> ${win}-month history of ${unit}, not against other banks. A score of +2&sigma; means this month sits two standard deviations above that bank's normal range — so 40,000 cards from a mid-size issuer can outrank 200,000 from a market leader. Banks under ${num(OUTLIER_MIN_BASE)} cards are excluded, and a month must be at least ${MULT_GATE}x the bank's own average to qualify. ${metric === "spend" ? "Spend excludes ATM cash withdrawals." : ""}`;
+
+  document.getElementById("outlierAbove").innerHTML =
+    `<div class="outlier-block"><h4 style="color:var(--accent);"><i class="fa-solid fa-arrow-trend-up"></i> Running hot against own trend <span class="count">${above.length}</span></h4>${renderOutlierTable(above, metric, "above")}</div>`;
+  document.getElementById("outlierBelow").innerHTML =
+    `<div class="outlier-block"><h4 style="color:var(--negative);"><i class="fa-solid fa-arrow-trend-down"></i> Running cold against own trend <span class="count">${below.length}</span></h4>${renderOutlierTable(below, metric, "below")}</div>`;
+
+  // Rows open the same drill-down drawer as the leaderboard.
+  document.querySelectorAll(".outlier-table tbody tr").forEach(tr =>
+    tr.addEventListener("click", () => openDrawer(tr.dataset.bank)));
+}
+
+/* Number of cards the Insights Panel shows. Two of these are pinned (industry net
+   card additions and industry spend movement) and always present when a prior
+   month exists; the rest are the highest-scoring of whatever else the month
+   supports. */
+const INSIGHT_COUNT = 10;      // industry-wide view
+const BANK_INSIGHT_COUNT = 6;  // when a specific bank is selected
+
 function generateInsights(monthLabel, maxBack) {
   maxBack = maxBack || 3;
   const banks = getComputedMonth(monthLabel);
@@ -2446,6 +2653,185 @@ function generateInsights(monthLabel, maxBack) {
       text: `The industry added ${num(Math.abs(netAdds))} cards ${netAdds >= 0 ? '' : '(net contraction) '}from ${prevMonth} to ${monthLabel}, a ${pct(netPct)} shift.`,
       detail: `Total outstanding cards moved from ${num(totalPrev)} in ${prevMonth} to ${num(totalNow)} in ${monthLabel}.${(oldestMonth && oldestMonth !== prevMonth) ? ` Over the fuller window back to ${oldestMonth}, see the ${trailing.length}-month momentum insight below for whether this pace is accelerating or fading.` : ""}`,
       action: trailing.length > 1 ? `Compare this figure against the ${trailing.length}-month window above to see whether industry growth is accelerating or plateauing, rather than judging a single month in isolation.` : `Check the Executive Summary's multi-month trend and the Historical Trends tab before reading a single month's move as a durable shift.` });
+
+    // Industry spend movement — pinned alongside net additions so the two headline
+    // industry numbers (how many cards, how much spend) are always present.
+    // Worded to handle either direction: spend can and does fall month to month.
+    const prevBanks = getComputedMonth(prevMonth);
+    const spendNow = banks.reduce((a, b) => a + (b.total_spend || 0), 0);
+    const spendPrev = prevBanks.reduce((a, b) => a + (b.total_spend || 0), 0);
+    const spendDiff = spendNow - spendPrev;
+    const spendPct = spendPrev > 0 ? (spendDiff / spendPrev) * 100 : null;
+    const volNow = banks.reduce((a, b) => a + (b.total_volume || 0), 0);
+    const volPrev = prevBanks.reduce((a, b) => a + (b.total_volume || 0), 0);
+    const volPct = volPrev > 0 ? ((volNow - volPrev) / volPrev) * 100 : null;
+    const rose = spendDiff >= 0;
+    add(20 + Math.min(Math.abs(spendPct || 0) * 4, 25), { icon: "fa-indian-rupee-sign", color: rose ? "accent" : "negative", title: "Industry spend movement",
+      text: `Industry spend ${rose ? "rose" : "fell"} ${money(Math.abs(Math.round(spendDiff)))} Cr from ${prevMonth} to ${monthLabel}, reaching ${money(Math.round(spendNow))} Cr — a ${pct(spendPct)} move. Excludes ATM cash withdrawals.`,
+      detail: `Spend went from ${money(Math.round(spendPrev))} Cr in ${prevMonth} to ${money(Math.round(spendNow))} Cr in ${monthLabel}, while transactions moved ${pct(volPct)}. ${netPct !== null && spendPct !== null && netPct > 0 && spendPct < 0 ? "Note the divergence: the card base grew while spend contracted, which means the average card was used less this cycle — usually seasonality or a post-festive comedown rather than structural demand loss." : netPct !== null && spendPct !== null && spendPct > netPct ? "Spend grew faster than the card base, so existing cards are being used harder rather than growth coming purely from new issuance." : "Spend and card-base growth are broadly in step this cycle."}`,
+      action: `Read this against Avg Ticket Size and Transactions in the Executive Summary — spend can move on frequency, on basket size, or on card count, and the three have very different commercial implications.` });
+  }
+
+  /* ---------------------------------------------------------------------
+     BANK-LEVEL MOVEMENT
+     Industry aggregates are already the KPI cards. What a P&L owner actually
+     reads is the league table: which specific issuer changed behaviour this
+     cycle, and whether that change is accelerating or fading. These compare a
+     bank against ITS OWN prior cycle, not against the industry.
+     --------------------------------------------------------------------- */
+  const MIN_BASE = 50000;  // below this, percentage moves are noise, not signal
+
+  if (prevMonth) {
+    const m2 = monthsBack(monthLabel, 2);
+    const prevB = getComputedMonth(prevMonth);
+    const prev2B = m2 ? getComputedMonth(m2) : null;
+    const findIn = (arr, name) => arr ? arr.find(x => x.bank_name === name) : null;
+
+    // Rank tables for both months, so league-table movement can be read directly.
+    const rankOf = arr => {
+      const map = {};
+      arr.slice().sort((a, b) => b.cards_outstanding - a.cards_outstanding)
+         .forEach((b, i) => { map[b.bank_name] = i + 1; });
+      return map;
+    };
+    const rNow = rankOf(banks), rPrev = rankOf(prevB);
+
+    const industryAdds = banks.reduce((a, b) => {
+      const p = findIn(prevB, b.bank_name);
+      return a + (p ? Math.max(b.cards_outstanding - p.cards_outstanding, 0) : 0);
+    }, 0);
+
+    const movers = banks.filter(b => b.cards_outstanding >= MIN_BASE).map(b => {
+      const p1 = findIn(prevB, b.bank_name);
+      const p2 = findIn(prev2B, b.bank_name);
+      const adds = p1 ? b.cards_outstanding - p1.cards_outstanding : null;
+      const addsPrev = (p1 && p2) ? p1.cards_outstanding - p2.cards_outstanding : null;
+      const spendChg = p1 ? b.total_spend - p1.total_spend : null;
+      const spendChgPrev = (p1 && p2) ? p1.total_spend - p2.total_spend : null;
+      return { b, p1, p2, adds, addsPrev, spendChg, spendChgPrev,
+        addsAccel: (adds !== null && addsPrev !== null) ? adds - addsPrev : null,
+        spendAccel: (spendChg !== null && spendChgPrev !== null) ? spendChg - spendChgPrev : null };
+    }).filter(m => m.p1);
+
+    /* Group every bank showing the same behaviour, not just the leader: anything
+       within `frac` of the leader's magnitude and moving the same direction. */
+    const cohort = (list, key, frac, max) => {
+      const ranked = list.filter(x => x[key] !== null && isFinite(x[key]))
+        .sort((a, b) => Math.abs(b[key]) - Math.abs(a[key]));
+      if (!ranked.length || Math.abs(ranked[0][key]) === 0) return [];
+      const top = Math.abs(ranked[0][key]), dir = Math.sign(ranked[0][key]);
+      return ranked.filter(x => Math.sign(x[key]) === dir && Math.abs(x[key]) >= top * frac).slice(0, max);
+    };
+    const alsoList = (arr, fmt) => arr.map(x => `${x.b.bank_name} (${fmt(x)})`).join(", ");
+
+    // 1. Net card additions accelerating or stalling, bank by bank
+    const addsC = cohort(movers, "addsAccel", 0.45, 4);
+    if (addsC.length) {
+      const L = addsC[0], up = L.addsAccel >= 0, others = addsC.slice(1);
+      add(34 + Math.min(Math.abs(L.addsAccel) / 2500, 22), { icon: up ? "fa-arrow-up-right-dots" : "fa-arrow-trend-down", color: up ? "accent" : "negative",
+        title: up ? "Issuance stepped up" : "Issuance stalled",
+        text: `${L.b.bank_name} added ${num(L.adds)} cards in ${monthLabel} against ${num(L.addsPrev)} in ${prevMonth} — a swing of ${num(Math.abs(L.addsAccel))} versus its own prior cycle.${others.length ? ` ${others.length === 1 ? "One other issuer shows" : "Others showing"} the same pattern: ${alsoList(others, x => `${num(x.adds)} vs ${num(x.addsPrev)}`)}.` : ""}`,
+        detail: `This compares each bank against its own previous month, not against the industry, so it isolates a genuine change in issuance behaviour from ordinary scale. ${L.b.bank_name}'s base now stands at ${num(L.b.cards_outstanding)} (${L.b.market_share.toFixed(2)}% share). ${up ? "A step-up of this size usually traces to a specific action: a co-brand launch, a sourcing-partner ramp, or a relaxed approval cut-off." : "A drop of this size is usually deliberate — tightened underwriting, a sourcing channel switched off, or portfolio clean-up of inactive cards."}`,
+        action: up ? `Find out what changed at ${L.b.bank_name} before assuming it is durable. Check next cycle whether the new run-rate holds or reverts — a one-month spike from a campaign looks identical to a structural shift in a single month of data.` : `Worth separating deliberate tightening from demand weakness. If ${L.b.bank_name} is pulling back on sourcing, that is share available to competitors this quarter.` });
+    }
+
+    // 2. Spend accelerating or decelerating, bank by bank
+    const spendC = cohort(movers, "spendAccel", 0.45, 4);
+    if (spendC.length) {
+      const L = spendC[0], up = L.spendAccel >= 0, others = spendC.slice(1);
+      add(32 + Math.min(Math.abs(L.spendAccel) / 250, 22), { icon: up ? "fa-fire" : "fa-arrow-down-wide-short", color: up ? "accent" : "negative",
+        title: up ? "Spend accelerating" : "Spend decelerating",
+        text: `${L.b.bank_name}'s spend moved ${money(Math.round(L.spendChg))} Cr in ${monthLabel} against ${money(Math.round(L.spendChgPrev))} Cr the cycle before — a ${up ? "step-up" : "step-down"} of ${money(Math.round(Math.abs(L.spendAccel)))} Cr.${others.length ? ` Same pattern at ${alsoList(others, x => `${money(Math.round(x.spendChg))} Cr vs ${money(Math.round(x.spendChgPrev))} Cr`)}.` : ""} Excludes ATM cash.`,
+        detail: `${L.b.bank_name} now does ${money(Math.round(L.b.total_spend))} Cr of monthly spend at ${money(Math.round(L.b.avg_spend_per_card))} per card and ${L.b.txn_per_card.toFixed(1)} transactions per card. Spend can move on card count, on frequency, or on basket size — check which by reading this against the bank's ticket size and transactions-per-card in the leaderboard.`,
+        action: `Spend momentum matters more than card momentum for revenue. If a competitor is accelerating here while you are flat, the gap compounds through interchange and revolve, not just through card count.` });
+    }
+
+    // 3. Activation gap — the classic cards problem: issuing plastic that never
+    //    gets used. Base growing while spend per card falls.
+    const gaps = movers.filter(m => m.p1 && m.p1.cards_outstanding > 0 && m.p1.avg_spend_per_card > 0)
+      .map(m => ({ ...m,
+        cardsPct: (m.adds / m.p1.cards_outstanding) * 100,
+        spcPct: ((m.b.avg_spend_per_card - m.p1.avg_spend_per_card) / m.p1.avg_spend_per_card) * 100 }))
+      .filter(m => m.cardsPct > 1 && m.spcPct < -2)
+      .sort((a, b) => (b.cardsPct - b.spcPct) - (a.cardsPct - a.spcPct)).slice(0, 4);
+    if (gaps.length) {
+      const L = gaps[0], others = gaps.slice(1);
+      add(36 + Math.min((L.cardsPct - L.spcPct) * 1.5, 20), { icon: "fa-plug-circle-exclamation", color: "negative", title: "Activation gap",
+        text: `${L.b.bank_name} grew its card base ${pct(L.cardsPct)} in ${monthLabel} while average spend per card fell ${pct(L.spcPct)} — new cards are landing faster than they are being used.${others.length ? ` ${others.length === 1 ? "Also" : "Same pattern at"}: ${alsoList(others, x => `${pct(x.cardsPct)} cards, ${pct(x.spcPct)} spend/card`)}.` : ""}`,
+        detail: `Spend per card at ${L.b.bank_name} moved from ${money(Math.round(L.p1.avg_spend_per_card))} to ${money(Math.round(L.b.avg_spend_per_card))}. A widening gap between issuance and usage is the standard signature of an acquisition push outrunning activation — cards issued on a spend-based incentive, never activated, and quietly dilutive to portfolio economics until they either activate or get written off.`,
+        action: `Issuance targets without an activation gate produce exactly this. If you run a similar sourcing mix, check your own 30/60/90-day activation curve before reading a competitor's card growth as share loss.` });
+    }
+
+    // 4. Incremental share vs stock share — who is capturing new issuance out of
+    //    proportion to their size. Very different from market share.
+    if (industryAdds > 0) {
+      const incr = movers.filter(m => m.adds > 0 && m.b.market_share > 0.3)
+        .map(m => ({ ...m, incShare: (m.adds / industryAdds) * 100, stock: m.b.market_share }))
+        .map(m => ({ ...m, mult: m.incShare / m.stock }))
+        .filter(m => m.mult >= 1.6)
+        .sort((a, b) => (b.incShare - b.stock) - (a.incShare - a.stock)).slice(0, 4);
+      if (incr.length) {
+        const L = incr[0], others = incr.slice(1);
+        add(33 + Math.min((L.incShare - L.stock) * 2, 20), { icon: "fa-bullseye", color: "accent", title: "Punching above weight on new issuance",
+          text: `${L.b.bank_name} holds ${L.stock.toFixed(1)}% of cards in force but captured ${L.incShare.toFixed(1)}% of every card added in ${monthLabel} — ${L.mult.toFixed(1)}x its weight.${others.length ? ` Also over-indexing: ${alsoList(others, x => `${x.incShare.toFixed(1)}% of adds on ${x.stock.toFixed(1)}% of base`)}.` : ""}`,
+          detail: `Market share is a stock measure and moves slowly; share of incremental issuance is the flow measure and turns first. A bank sustaining a multiple above 1.5x is compounding share whether or not the league table has caught up yet. ${L.b.bank_name} added ${num(L.adds)} of the ${num(industryAdds)} cards issued industry-wide this cycle.`,
+          action: `Flow share is the leading indicator of stock share. Track this multiple monthly for your closest competitors — by the time it shows up in market share, roughly two to three quarters of advantage has already been handed over.` });
+      }
+    }
+
+    // 5. ATM cash-advance mix rising — a genuine early credit-stress signal, and
+    //    the one number in this dataset that Risk cares about more than Business.
+    const atmUp = movers.filter(m => m.p1 && m.b.atm_share_of_business > 1)
+      .map(m => ({ ...m, atmDelta: m.b.atm_share_of_business - m.p1.atm_share_of_business }))
+      .filter(m => m.atmDelta > 0.3)
+      .sort((a, b) => b.atmDelta - a.atmDelta).slice(0, 4);
+    if (atmUp.length) {
+      const L = atmUp[0], others = atmUp.slice(1);
+      add(30 + Math.min(L.atmDelta * 8, 22), { icon: "fa-triangle-exclamation", color: "negative", title: "Cash-advance mix rising",
+        text: `Cash withdrawal climbed to ${L.b.atm_share_of_business.toFixed(1)}% of ${L.b.bank_name}'s total card business in ${monthLabel}, up ${L.atmDelta.toFixed(1)} points from ${prevMonth}.${others.length ? ` Also rising at ${alsoList(others, x => `${x.b.atm_share_of_business.toFixed(1)}%, up ${x.atmDelta.toFixed(1)}pts`)}.` : ""}`,
+        detail: `Cash advances on a credit card carry a fee from rupee one and no interest-free period, so they are the most expensive way a cardholder can use the product. Customers reach for them when other liquidity has run out. A sustained rise in this mix typically leads delinquency by a quarter or two, which makes it one of the few forward-looking signals available in public monthly data.`,
+        action: `If this rises for two or three consecutive cycles at a bank, it is worth treating as an early portfolio-quality signal rather than a usage statistic. Benchmark your own cash-advance mix on the same basis.` });
+    }
+
+    // 6. League-table movement
+    const rankMoves = banks.filter(b => b.cards_outstanding >= MIN_BASE && rPrev[b.bank_name])
+      .map(b => ({ b, from: rPrev[b.bank_name], to: rNow[b.bank_name], move: rPrev[b.bank_name] - rNow[b.bank_name] }))
+      .filter(x => x.move !== 0 && x.to <= 20)
+      .sort((a, b) => Math.abs(b.move) - Math.abs(a.move) || a.to - b.to).slice(0, 4);
+    if (rankMoves.length) {
+      const L = rankMoves[0], others = rankMoves.slice(1);
+      const up = L.move > 0;
+      add(26 + Math.min(Math.abs(L.move) * 6, 16) + Math.max(0, 12 - L.to), { icon: "fa-ranking-star", color: up ? "accent" : "negative", title: "League table moved",
+        text: `${L.b.bank_name} moved ${up ? "up" : "down"} from rank ${L.from} to ${L.to} on cards outstanding between ${prevMonth} and ${monthLabel}.${others.length ? ` Other changes: ${others.map(x => `${x.b.bank_name} ${x.from}→${x.to}`).join(", ")}.` : ""}`,
+        detail: `Rank changes at the top of the table are rare and slow, which is exactly why they get noticed internally and externally. ${L.b.bank_name} now holds ${num(L.b.cards_outstanding)} cards at ${L.b.market_share.toFixed(2)}% share.`,
+        action: `Rank is the number that ends up in board decks and press coverage regardless of whether it is the most meaningful metric. Worth knowing before someone else raises it.` });
+    }
+
+    // 7. Share movement — card share is the number everyone quotes, but it only
+    //    tells half the story. Gaining card share while losing spend share means
+    //    winning volume without winning monetisation.
+    const shareMoves = movers.filter(m => m.p1)
+      .map(m => ({ ...m,
+        cardShareDelta: m.b.market_share - m.p1.market_share,
+        spendShareDelta: m.b.market_share_by_spend - m.p1.market_share_by_spend }))
+      .filter(m => Math.abs(m.cardShareDelta) >= 0.05);
+    const shareC = cohort(shareMoves, "cardShareDelta", 0.5, 4);
+    if (shareC.length) {
+      const L = shareC[0], gaining = L.cardShareDelta >= 0, others = shareC.slice(1);
+      // Divergence is the interesting case: share of cards and share of spend
+      // moving in opposite directions.
+      const diverges = Math.sign(L.cardShareDelta) !== Math.sign(L.spendShareDelta)
+        && Math.abs(L.spendShareDelta) >= 0.03;
+      add(29 + Math.min(Math.abs(L.cardShareDelta) * 25, 20) + (diverges ? 8 : 0), {
+        icon: gaining ? "fa-chart-pie" : "fa-circle-half-stroke",
+        color: diverges ? "negative" : (gaining ? "accent" : "negative"),
+        title: diverges ? "Card share and spend share diverging" : (gaining ? "Card share gained" : "Card share lost"),
+        text: `${L.b.bank_name} ${gaining ? "gained" : "lost"} ${Math.abs(L.cardShareDelta).toFixed(2)} points of card share in ${monthLabel}, moving from ${L.p1.market_share.toFixed(2)}% to ${L.b.market_share.toFixed(2)}%. Its spend share moved ${L.spendShareDelta >= 0 ? "+" : ""}${L.spendShareDelta.toFixed(2)} points over the same cycle.${others.length ? ` Also moving: ${alsoList(others, x => `${x.cardShareDelta >= 0 ? "+" : ""}${x.cardShareDelta.toFixed(2)} pts cards, ${x.spendShareDelta >= 0 ? "+" : ""}${x.spendShareDelta.toFixed(2)} pts spend`)}.` : ""}`,
+        detail: diverges
+          ? `The two are moving in opposite directions, which is the case worth pausing on. ${gaining ? `${L.b.bank_name} is taking a larger slice of cards in force while its slice of industry spend shrinks — growth is coming from cards that transact below the industry average.` : `${L.b.bank_name} is shedding card share while holding or growing spend share, which usually means a deliberate clean-up of low-activity accounts rather than competitive loss.`} Card share is a stock measure of plastic issued; spend share is the one that converts to interchange and revolve income.`
+          : `Both measures are moving in the same direction, so the shift is broad rather than a mix effect. ${L.b.bank_name} now holds ${L.b.market_share.toFixed(2)}% of cards against ${L.b.market_share_by_spend.toFixed(2)}% of spend, at ${money(Math.round(L.b.avg_spend_per_card))} spend per card.`,
+        action: `Track both series side by side rather than card share alone. A bank can lead the card league table and still be losing the revenue race, and that gap only shows when the two are read together.` });
+    }
   }
 
   // Multi-month (or however many are available) momentum — the anchor for "don't just
@@ -2526,8 +2912,37 @@ function generateInsights(monthLabel, maxBack) {
       detail: `ATM cash withdrawal on credit cards is typically the costliest form of usage for cardholders (cash-advance fees, no interest-free period) and the most risk-sensitive for issuers. A rising ATM-cash share over the trailing window can be an early indicator of liquidity stress among cardholders.`,
       action: trailing.length > 1 ? `Set an internal alert threshold on ATM-cash mix — a sustained rise across the trailing ${trailing.length}-month window is worth flagging to Risk, independent of headline spend growth.` : `Set an internal alert threshold on ATM-cash mix — track this month-over-month, since a sustained rise is worth flagging to Risk independent of headline spend growth.` }); }
 
+  // Top-4 concentration — always available (needs no prior month), and the single
+  // most quoted structural fact about this market.
+  if (byCards.length >= 4 && totalAll > 0) {
+    const top4 = byCards.slice(0, 4);
+    const top4Share = top4.reduce((a, b) => a + b.market_share, 0);
+    add(15 + Math.min(top4Share / 5, 18), { icon: "fa-layer-group", color: "primary", title: "Top-4 concentration",
+      text: `The four largest issuers hold ${top4Share.toFixed(1)}% of every credit card in the market in ${monthLabel}: ${top4.map(b => `${b.bank_name} ${b.market_share.toFixed(1)}%`).join(", ")}.`,
+      detail: `The remaining ${(100 - top4Share).toFixed(1)}% is spread across ${byCards.length - 4} other issuers. Concentration at this level means industry-wide averages are effectively driven by these four banks — a shift in any one of them moves the headline numbers on its own.`,
+      action: `When reading any industry aggregate, check whether the move is broad-based or just one of the top four. The Growth Contribution waterfall separates the two.` });
+  }
+
+  // Spend share vs card share — which issuers punch above their weight on usage.
+  // Also always available.
+  const weightGap = banks.filter(b => b.cards_outstanding > 50000)
+    .map(b => ({ ...b, gap: b.market_share_by_spend - b.market_share }))
+    .sort((a, b) => b.gap - a.gap);
+  if (weightGap.length) {
+    const over = weightGap[0], under = weightGap[weightGap.length - 1];
+    add(13 + Math.min(Math.abs(over.gap) * 3, 16), { icon: "fa-scale-unbalanced", color: "accent", title: "Usage vs issuance gap",
+      text: `${over.bank_name} punches hardest above its weight: ${over.market_share.toFixed(1)}% of cards but ${over.market_share_by_spend.toFixed(1)}% of spend, a ${over.gap.toFixed(1)}-point gap in ${monthLabel}.`,
+      detail: `At the other end, ${under.bank_name} holds ${under.market_share.toFixed(1)}% of cards against ${under.market_share_by_spend.toFixed(1)}% of spend (${under.gap.toFixed(1)} points), pointing to a larger share of low-activity cards. Spend share above card share generally signals a premium or well-activated portfolio; below signals dormancy.`,
+      action: `Activation rate, not issuance, is what separates these two ends. Worth checking your own position on this gap before setting a new-card target.` });
+  }
+
   candidates.sort((a, b) => b.score - a.score);
-  return candidates.map(({ score, ...rest }) => rest);
+  // Pinned insights (industry net additions and industry spend movement) always
+  // appear, ahead of the score-ranked remainder. The panel shows a fixed count so
+  // the section looks the same every month rather than expanding and contracting.
+  const pinned = candidates.filter(c => c.pinned);
+  const rest = candidates.filter(c => !c.pinned);
+  return pinned.concat(rest).slice(0, INSIGHT_COUNT).map(({ score, pinned: _p, ...keep }) => keep);
 }
 
 /* Bank-specific insights — anchored at the SELECTED month, comparing against at most its
@@ -2598,6 +3013,45 @@ function generateBankInsights(bankName, monthLabel, maxBack) {
 
   const ticketFirst = first.bank.ticket_size, ticketLast = last.bank.ticket_size;
   const ticketChange = ticketFirst > 0 ? ((ticketLast - ticketFirst) / ticketFirst) * 100 : null;
+  // Spend momentum for this bank across the window.
+  const spendFirst = first.bank.total_spend, spendLast = last.bank.total_spend;
+  const spendGrowth = spendFirst > 0 ? ((spendLast - spendFirst) / spendFirst) * 100 : null;
+  if (spendGrowth !== null) {
+    add(24 + Math.min(Math.abs(spendGrowth) * 1.8, 30), { icon: "fa-indian-rupee-sign", color: spendGrowth >= 0 ? "accent" : "negative", title: `Spend trend (${first.month} → ${last.month})`,
+      text: `${bankName}'s monthly spend moved from ${money(Math.round(spendFirst))} Cr to ${money(Math.round(spendLast))} Cr, ${pct(spendGrowth)} across the window. Excludes ATM cash withdrawals.`,
+      detail: `Spend per card sits at ${money(Math.round(last.bank.avg_spend_per_card))} against an average ticket of ${money(Math.round(last.bank.ticket_size))} across ${last.bank.txn_per_card.toFixed(1)} transactions per card. Compare the direction here against the card base trend above: spend growing faster than the base means existing cards are being used harder, and slower means new cards are diluting average usage.`,
+      action: `Spend, not card count, is what converts to interchange and revolve income. If the two are diverging for this bank, the card number is the less useful one to quote.` });
+  }
+
+  // Activation health: is spend per card keeping up with the base?
+  const spcFirst = first.bank.avg_spend_per_card, spcLast = last.bank.avg_spend_per_card;
+  const spcChange = spcFirst > 0 ? ((spcLast - spcFirst) / spcFirst) * 100 : null;
+  if (spcChange !== null) {
+    const diluting = (cardGrowth || 0) > 0 && spcChange < 0;
+    add((diluting ? 30 : 16) + Math.min(Math.abs(spcChange) * 1.5, 22), { icon: "fa-plug-circle-bolt", color: diluting ? "negative" : (spcChange >= 0 ? "accent" : "primary"), title: diluting ? "Usage diluting as base grows" : "Spend per card trend",
+      text: `Average spend per card at ${bankName} moved from ${money(Math.round(spcFirst))} to ${money(Math.round(spcLast))}, ${pct(spcChange)} across the window${diluting ? `, while the card base grew ${pct(cardGrowth)} over the same period` : ""}.`,
+      detail: diluting
+        ? `This is the classic activation gap: cards are being issued faster than they are being brought into use, so the average dilutes even when total spend is flat or rising. Left unaddressed it shows up later as dormant-card cost and eventual write-off rather than as revenue.`
+        : `Spend per card is the cleanest single read on portfolio quality available in this dataset, because it is unaffected by portfolio size. Rising means existing cardholders are transacting more, or newer cards are activating quickly.`,
+      action: diluting
+        ? `Worth checking the 30/60/90-day activation curve behind this. Issuance targets without an activation gate reliably produce this pattern.`
+        : `Benchmark this against peers of a similar size rather than the industry average, which is dominated by the top four issuers.` });
+  }
+
+  // Where this bank sits against its OWN recent history, using the same z-score
+  // basis as the "vs own trend" tabs, so the two views never disagree.
+  const ownCards = computeTrendOutliers(monthLabel, "cards");
+  const ownRow = ownCards.above.concat(ownCards.below).find(r => r.bank === bankName);
+  if (ownRow) {
+    const hot = ownRow.z > 0;
+    add(34 + Math.min(Math.abs(ownRow.z) * 1.5, 20), { icon: hot ? "fa-fire-flame-curved" : "fa-snowflake", color: hot ? "accent" : "negative", title: hot ? "Unusual month against own trend" : "Below own trend",
+      text: `${bankName} added ${num(Math.round(ownRow.value))} cards in ${monthLabel} against its own ${ownRow.months}-month average of ${num(Math.round(ownRow.mean))} — ${ownRow.mult.toFixed(1)}x its normal run-rate, or ${(ownRow.z >= 0 ? "+" : "") + ownRow.z.toFixed(1)} standard deviations from its usual range.`,
+      detail: `This measures the bank only against itself, so it is unaffected by size. A reading beyond two standard deviations means the month falls outside what this bank normally does, which is the threshold at which a change is more likely to reflect a decision than ordinary variation.`,
+      action: hot
+        ? `Check next cycle whether the new run-rate holds. A campaign spike and a genuine step-change look identical in a single month of data.`
+        : `A month this far below the bank's own range is usually deliberate — tightened underwriting, a sourcing channel paused, or inactive-card clean-up.` });
+  }
+
   add(10 + Math.min(Math.abs(ticketChange || 0) * 1.5, 22), { icon: "fa-basket-shopping", color: (ticketChange || 0) >= 0 ? "primary" : "negative", title: "Average ticket size trend",
     text: `Average ticket size moved ${pct(ticketChange)} across ${namedList(priorSeries, p => money(Math.round(p.bank.ticket_size)))}, reaching ${money(Math.round(ticketLast))} in ${last.month}.`,
     detail: `Spend per card in ${last.month} is ${money(Math.round(last.bank.avg_spend_per_card))} and transactions per card are ${last.bank.txn_per_card.toFixed(2)}. A rising ticket size with flat frequency suggests bigger-basket, lower-frequency usage (EMI/durables); a falling ticket size with rising frequency suggests everyday-spend habituation.`,
@@ -2612,7 +3066,10 @@ function renderInsights(monthLabel) {
   const bankMode = !!state.insightBank;
   // Section 06 (Insights Panel) is intentionally scoped to a single immediate-prior-month
   // comparison, unlike the Executive Brief's multi-month trailing window.
-  const insights = bankMode ? generateBankInsights(state.insightBank, monthLabel, 1) : generateInsights(monthLabel, 1);
+  const insights = bankMode
+    ? generateBankInsights(state.insightBank, monthLabel, 1).slice(0, BANK_INSIGHT_COUNT)
+    : generateInsights(monthLabel, 1);
+  renderOutliers(monthLabel);
   const grid = document.getElementById("insightsGrid");
   const subtitle = document.getElementById("insightsSubtitle");
   const prevMonth = monthsBack(monthLabel, 1);
@@ -3668,6 +4125,12 @@ function wireEvents() {
 
   // Leaderboard channel columns: % of spend / ₹Cr / transaction counts.
   // ATM stays outside this group in its own permanent columns.
+  // Insights section tabs: prose cards vs the two own-trend outlier tables.
+  document.querySelectorAll("#insightTabs button").forEach(btn => btn.addEventListener("click", () => {
+    state.insightTab = btn.dataset.itab;
+    renderInsights(state.activeMonth);
+  }));
+
   document.querySelectorAll("#channelViewToggle button").forEach(btn => btn.addEventListener("click", () => {
     state.channelView = btn.dataset.cv;
     // If the active sort sat on a channel column, carry it to the equivalent
