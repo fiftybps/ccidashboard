@@ -41,7 +41,7 @@ from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
 DATA_FILE = "data.json"
 MARKER_FILE = ".last_notified"
 PDF_FILE = "monthly-report.pdf"
-DASHBOARD_URL = "https://fiftybps.github.io/"
+DASHBOARD_URL = "https://fiftybps.github.io/ccidashboard/"
 
 # Brand palette, matching the dashboard's CSS variables
 BLUE = colors.HexColor("#0052CC")
